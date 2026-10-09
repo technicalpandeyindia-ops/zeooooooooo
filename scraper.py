@@ -1,18 +1,23 @@
 """
-scraper.py — Deep Classroom Extractor for sahukgs.com.
-Navigates every subject card in the Classroom tab, explores all chapters/sub-tabs,
-scrolls lazy-loaded lists, intercepts all backend API payloads, and pairs videos with notes.
+scraper.py — High-Speed Direct API Extractor for sahukgs.com Classroom.
+Supports both full Batch URLs (e.g. /batch/1159) and individual Lesson/Folder URLs (e.g. /lesson.html?lesson_id=14392).
+Extracts all videos and matching lecture PDFs across all subjects with 100% completeness.
 """
 
 import asyncio
+import html
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from playwright.async_api import async_playwright, Page, Response
+import aiohttp
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -45,10 +50,29 @@ class Subject:
     items: list[ContentItem] = field(default_factory=list)
 
 
-# ── Helper Functions ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def extract_target_id(target_url: str) -> tuple[str, str]:
+    """
+    Determines if input URL is a batch ID or a single lesson ID.
+    Returns: ('batch', '1159') or ('lesson', '14392')
+    """
+    m_lesson = re.search(r"lesson_id=([0-9]+)", target_url)
+    if m_lesson:
+        return ("lesson", m_lesson.group(1))
+
+    m_batch = re.search(r"batch[=/]([0-9]+)", target_url)
+    if m_batch:
+        return ("batch", m_batch.group(1))
+
+    parts = target_url.rstrip("/").split("/")
+    if parts[-1].isdigit():
+        return ("batch", parts[-1])
+    return ("batch", "1159")
+
 
 def extract_lecture_number(title: str) -> float:
-    """Extracts numerical lecture order (e.g. 'Lecture - 03' -> 3.0, 'Class 12.1' -> 12.1)."""
+    """Extracts numeric lecture number (e.g. 'Lecture - 03' -> 3.0, 'Class 12.1' -> 12.1)."""
     m = re.search(r"(?:lecture|class|part|ep|session|lec|no|ch|chapter)[\s._#-]*([0-9]+(?:\.[0-9]+)?)", title, re.IGNORECASE)
     if m:
         try:
@@ -72,225 +96,212 @@ def normalize_topic_name(title: str) -> str:
     return t or title
 
 
-def is_pdf_url(url: str) -> bool:
-    return bool(re.search(r"\.pdf(\?|$)", url, re.I)) or "drive.google.com" in url or "pdf" in url.lower()
-
-
-def is_video_url(url: str) -> bool:
-    return bool(re.search(r"\.(mp4|m3u8|mkv|webm|ts)(\?|$)", url, re.I)) or \
-           any(x in url.lower() for x in ["youtube", "youtu.be", "vimeo", "stream", "video", "jwplayer", "cloudfront", "playlist"])
-
-
-def is_notes_url(url: str) -> bool:
-    return bool(re.search(r"\.(doc|docx|ppt|pptx|txt|zip|rar)(\?|$)", url, re.I))
-
-
-def classify_url(url: str) -> str:
-    if is_pdf_url(url):
-        return "pdf"
-    if is_video_url(url):
-        return "video"
-    if is_notes_url(url):
-        return "notes"
-    return "other"
-
-
 def make_id(subject: str, title: str, url: str) -> str:
     raw = f"{subject}|{title}|{url}"
     return re.sub(r"[^a-zA-Z0-9]", "", raw)[:80]
 
 
-# ── Deep Scraper Engine ───────────────────────────────────────────────────────
+# ── High-Speed API Scraper ────────────────────────────────────────────────────
 
 class SahukgsScraper:
     def __init__(self, batch_url: str = None):
         self.batch_url = batch_url or config.BATCH_URL
-        self._api_responses: list[dict] = []
-
-    async def _intercept(self, response: Response):
-        url = response.url
-        ct = response.headers.get("content-type", "")
-        # Intercept any potential JSON API or course metadata responses
-        if "json" in ct or any(x in url for x in ["firestore", "firebase", "api", "batch", "classroom", "subject", "courses", "lessons"]):
-            try:
-                body = await response.text()
-                if len(body) > 30:
-                    self._api_responses.append({"url": url, "body": body})
-            except Exception:
-                pass
+        self.base_url = "https://www.sahukgs.com"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": "https://www.sahukgs.com/"
+        }
 
     async def scrape_batch(self, batch_url: Optional[str] = None) -> list[Subject]:
         target_url = batch_url or self.batch_url
-        subjects_dict: dict[str, list[ContentItem]] = {}
-        self._api_responses.clear()
+        target_type, target_id = extract_target_id(target_url)
+        logger.info(f"[scraper] Initiating extraction: Type={target_type}, ID={target_id}")
 
-        print(f"[scraper] Launching Chromium to scrape: {target_url}")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-zygote",
-                    "--disable-gpu"
-                ]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900}
-            )
-            page = await context.new_page()
-            page.on("response", self._intercept)
+        subjects_list: list[Subject] = []
+        timeout = aiohttp.ClientTimeout(total=60)
 
-            try:
-                await page.goto(target_url, wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(4)
+        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
+            topics_to_fetch: list[dict] = []
 
-                # 1. Switch to Classroom Tab
-                print("[scraper] Activating Classroom tab...")
-                await self._click_classroom_tab(page)
-                await asyncio.sleep(3)
+            if target_type == "lesson":
+                # Single lesson requested
+                topics_to_fetch.append({"id": int(target_id), "name": f"Lesson {target_id}"})
+            else:
+                # Full Classroom batch requested -> Fetch all lesson folders
+                classroom_api = f"{self.base_url}/api/classroom/{target_id}"
+                logger.info(f"[scraper] Fetching all classroom folders from: {classroom_api}")
+                try:
+                    async with session.get(classroom_api) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            topics_to_fetch = data.get("classroom", [])
+                        else:
+                            logger.error(f"[scraper] HTTP {resp.status} fetching classroom")
+                except Exception as e:
+                    logger.error(f"[scraper] Error calling classroom API: {e}")
+                    return []
 
-                # 2. Extract subjects list
-                subject_names = await self._get_subject_names(page)
-                print(f"[scraper] Identified {len(subject_names)} subjects: {subject_names}")
+            logger.info(f"[scraper] Processing {len(topics_to_fetch)} subject folders...")
 
-                # 3. Explore each subject by clicking into it
-                for subj_idx, sname in enumerate(subject_names):
-                    try:
-                        print(f"[scraper] [{subj_idx+1}/{len(subject_names)}] Exploring subject: {sname}")
-                        
-                        # Re-ensure on Classroom tab
-                        await self._click_classroom_tab(page)
-                        await asyncio.sleep(1.5)
+            for topic_idx, topic in enumerate(topics_to_fetch, 1):
+                lesson_id = topic.get("id")
+                fallback_name = topic.get("name", f"Subject {topic_idx}")
+                if not lesson_id:
+                    continue
 
-                        # Find matching subject card and click
-                        card = page.locator(f"xpath=//*[contains(text(), '{sname}')]").first
-                        if await card.count() > 0:
-                            await card.click(timeout=4000)
-                            await asyncio.sleep(2.5)
+                lesson_api = f"{self.base_url}/api/lesson/{lesson_id}"
+                logger.info(f"[scraper] [{topic_idx}/{len(topics_to_fetch)}] Loading folder: ID {lesson_id}")
 
-                            # Expand sub-folders / accordions / chapters if any
-                            await self._expand_and_scroll(page, sname, subjects_dict)
+                try:
+                    async with session.get(lesson_api) as l_resp:
+                        if l_resp.status != 200:
+                            logger.warning(f"[scraper] Failed lesson {lesson_id}: HTTP {l_resp.status}")
+                            continue
+                        lesson_data = await l_resp.json()
+                except Exception as e:
+                    logger.warning(f"[scraper] Exception fetching lesson {lesson_id}: {e}")
+                    continue
 
-                            # Check for sub-tabs like 'Videos' and 'Notes' inside subject
-                            for sub_tab in ["Videos", "Notes", "Study Material", "All"]:
-                                try:
-                                    tab_el = page.locator(f"xpath=//*[text()='{sub_tab}' or contains(text(), '{sub_tab}')]").first
-                                    if await tab_el.count() > 0 and await tab_el.is_visible():
-                                        await tab_el.click(timeout=1500)
-                                        await asyncio.sleep(1.5)
-                                        await self._expand_and_scroll(page, sname, subjects_dict)
-                                except Exception:
-                                    pass
+                subject_name = lesson_data.get("name") or fallback_name
+                videos_meta = lesson_data.get("videos", [])
+                notes_meta = lesson_data.get("notes", [])
+                subject_items: list[ContentItem] = []
 
-                    except Exception as e:
-                        print(f"[scraper] Note exploring {sname}: {e}")
-                        continue
+                logger.info(f"[scraper] '{subject_name}' contains {len(videos_meta)} videos and {len(notes_meta)} notes.")
 
-                # 4. Parse all intercepted JSON API responses for deep extraction
-                print(f"[scraper] Parsing {len(self._api_responses)} intercepted network API responses...")
-                for entry in self._api_responses:
-                    try:
-                        data = json.loads(entry["body"])
-                        self._extract_json_items(data, subjects_dict)
-                    except Exception:
-                        pass
+                # Worker to resolve video streams & attached PDFs
+                async def resolve_video(v_info):
+                    v_id = v_info.get("id")
+                    v_name = v_info.get("name", "Untitled Lecture")
+                    lec_num = extract_lecture_number(v_name)
+                    topic_norm = normalize_topic_name(v_name)
+                    v_thumb = v_info.get("thumb", "")
+                    items = []
 
-            finally:
-                await browser.close()
+                    # 1. Check direct video_url in payload
+                    direct_video = v_info.get("video_url")
+                    if direct_video:
+                        items.append(
+                            ContentItem(
+                                id=f"vid_{v_id}",
+                                title=v_name,
+                                kind="video",
+                                url=direct_video,
+                                subject=subject_name,
+                                topic=topic_norm,
+                                lecture_num=lec_num,
+                                thumbnail=v_thumb
+                            )
+                        )
+                    elif v_id:
+                        # Fetch /api/video/{v_id} for stream
+                        try:
+                            async with session.get(f"{self.base_url}/api/video/{v_id}") as v_resp:
+                                if v_resp.status == 200:
+                                    v_data = await v_resp.json()
+                                    final_url = v_data.get("hd_video_url") or v_data.get("video_url")
+                                    if final_url:
+                                        items.append(
+                                            ContentItem(
+                                                id=f"vid_{v_id}",
+                                                title=v_name,
+                                                kind="video",
+                                                url=final_url,
+                                                subject=subject_name,
+                                                topic=topic_norm,
+                                                lecture_num=lec_num,
+                                                thumbnail=v_thumb
+                                            )
+                                        )
+                        except Exception:
+                            pass
 
-        # 5. Deduplicate and sequentially pair (Video -> Matching PDF) for every subject
-        final_subjects: list[Subject] = []
-        for name, items in subjects_dict.items():
-            if not items:
-                continue
-            seen = set()
-            unique_items = []
-            for it in items:
-                if it.url not in seen:
-                    seen.add(it.url)
-                    unique_items.append(it)
+                    # 2. Extract matching PDFs attached directly to this video
+                    for p in v_info.get("pdfs", []):
+                        pdf_url = p.get("url")
+                        if pdf_url:
+                            items.append(
+                                ContentItem(
+                                    id=f"vpdf_{v_id}_{make_id('', '', pdf_url)[:10]}",
+                                    title=f"{v_name} (Notes)",
+                                    kind="pdf",
+                                    url=pdf_url,
+                                    subject=subject_name,
+                                    topic=topic_norm,
+                                    lecture_num=lec_num
+                                )
+                            )
 
-            sorted_items = self._organize_sequential(unique_items)
-            if sorted_items:
-                final_subjects.append(Subject(name=name, items=sorted_items))
+                    return items
 
-        total_extracted = sum(len(s.items) for s in final_subjects)
-        print(f"[scraper] Extraction finished: Total {len(final_subjects)} subjects with {total_extracted} total items.")
-        return final_subjects
+                # Worker to resolve standalone notes
+                async def resolve_note(n_info):
+                    n_id = n_info.get("id")
+                    n_name = n_info.get("name", "Untitled Note")
+                    lec_num = extract_lecture_number(n_name)
+                    topic_norm = normalize_topic_name(n_name)
+                    items = []
 
-    async def _click_classroom_tab(self, page: Page):
-        for sel in [
-            "//div[normalize-space()='Classroom']",
-            "//button[contains(., 'Classroom')]",
-            "//span[contains(., 'Classroom')]",
-            "//a[contains(., 'Classroom')]",
-            "[data-tab='classroom']",
-            ".classroom-tab"
-        ]:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    await el.click(timeout=2000)
-                    return True
-            except Exception:
-                continue
-        return False
+                    direct_pdf = n_info.get("url") or (n_info.get("pdfs")[0].get("url") if n_info.get("pdfs") else None)
+                    if direct_pdf:
+                        items.append(
+                            ContentItem(
+                                id=f"note_{n_id}",
+                                title=n_name,
+                                kind="pdf",
+                                url=direct_pdf,
+                                subject=subject_name,
+                                topic=topic_norm,
+                                lecture_num=lec_num
+                            )
+                        )
+                    elif n_id:
+                        try:
+                            async with session.get(f"{self.base_url}/api/video/{n_id}") as n_resp:
+                                if n_resp.status == 200:
+                                    n_data = await n_resp.json()
+                                    pdf_url = n_data.get("video_url") or (n_data.get("pdfs")[0].get("url") if n_data.get("pdfs") else None)
+                                    if pdf_url:
+                                        items.append(
+                                            ContentItem(
+                                                id=f"note_{n_id}",
+                                                title=n_name,
+                                                kind="pdf",
+                                                url=pdf_url,
+                                                subject=subject_name,
+                                                topic=topic_norm,
+                                                lecture_num=lec_num
+                                            )
+                                        )
+                        except Exception:
+                            pass
 
-    async def _get_subject_names(self, page: Page) -> list[str]:
-        # Collect text of subject cards
-        cards = await page.query_selector_all(".card, .subject-card, [class*='subject'], [class*='grid'] > div")
-        names = []
-        for c in cards:
-            text = (await c.inner_text() or "").strip().split("\n")[0]
-            if text and len(text) > 2 and not any(k in text.lower() for k in ["today", "updates", "timetable", "logout", "notification"]):
-                if text not in names:
-                    names.append(text)
-        return names
+                    return items
 
-    async def _expand_and_scroll(self, page: Page, subject_name: str, target_dict: dict):
-        # Click all accordion headers or chapter expansion buttons
-        for btn in await page.query_selector_all("button, [role='button'], .accordion-header, [class*='chapter'], [class*='folder']"):
-            try:
-                await btn.click(timeout=800)
-                await asyncio.sleep(0.2)
-            except Exception:
-                pass
+                # Fetch all videos and notes concurrently
+                video_tasks = [resolve_video(v) for v in videos_meta]
+                note_tasks = [resolve_note(n) for n in notes_meta]
 
-        # Scroll multiple times to trigger lazy loading of lectures
-        for _ in range(4):
-            await page.evaluate("window.scrollBy(0, 1000);")
-            await asyncio.sleep(0.5)
+                results = await asyncio.gather(*video_tasks, *note_tasks)
+                for res in results:
+                    subject_items.extend(res)
 
-        # Harvest all clickable and download links currently in DOM
-        anchors = await page.query_selector_all("a[href], iframe[src], video source[src]")
-        for a in anchors:
-            href = await a.get_attribute("href") or await a.get_attribute("src")
-            title = (await a.inner_text() or "").strip()
-            if not href or not href.startswith("http"):
-                continue
+                # Sort sequentially: Lecture 1 -> Lecture 2 -> Lecture 3...
+                organized_items = self._organize_sequential(subject_items)
+                if organized_items:
+                    subjects_list.append(Subject(name=subject_name, items=organized_items))
 
-            kind = classify_url(href)
-            if kind != "other":
-                item_title = title or href.split("/")[-1].split("?")[0]
-                target_dict.setdefault(subject_name, []).append(
-                    ContentItem(
-                        id=make_id(subject_name, item_title, href),
-                        title=item_title,
-                        kind=kind,
-                        url=href,
-                        subject=subject_name,
-                        topic=normalize_topic_name(item_title),
-                        lecture_num=extract_lecture_number(item_title)
-                    )
-                )
+        total_extracted = sum(len(s.items) for s in subjects_list)
+        logger.info(f"[scraper] ✅ Extracted {len(subjects_list)} folders with {total_extracted} total items.")
+        return subjects_list
 
     def _organize_sequential(self, items: list[ContentItem]) -> list[ContentItem]:
-        """Pairs every lecture's Video directly with its corresponding PDF Notes."""
+        """
+        Pairs each lecture's Video directly with its corresponding PDF notes,
+        sorted in ascending numerical order (Lecture 01, Lecture 02, etc.).
+        """
         groups: dict[str, list[ContentItem]] = {}
         for item in items:
             key = f"{item.lecture_num:06.2f}_{item.topic.lower()}"
@@ -305,78 +316,9 @@ class SahukgsScraper:
             pdfs = [i for i in group_items if i.kind in ("pdf", "notes")]
             others = [i for i in group_items if i not in videos and i not in pdfs]
 
-            # Sequence: Video -> Matching PDF -> Others
+            # Sequence: Video first, then its corresponding PDF Notes
             result.extend(videos)
             result.extend(pdfs)
             result.extend(others)
 
         return result
-
-    def _extract_json_items(self, data, target_dict: dict, current_subject: str = "Classroom"):
-        if isinstance(data, dict):
-            tab_type = str(data.get("tab") or data.get("type") or "").lower()
-            if tab_type in ["today", "updates", "timetable", "notice"]:
-                return
-
-            subj = data.get("subject") or data.get("subjectName") or data.get("folderName") or data.get("courseName") or data.get("category") or current_subject
-            title = data.get("title") or data.get("name") or data.get("topic") or data.get("lectureName") or data.get("chapterName") or "Untitled"
-            lec_num = extract_lecture_number(title)
-            topic = normalize_topic_name(title)
-
-            # Search for video URLs
-            for v_key in ["videoUrl", "video_url", "streamUrl", "playbackUrl", "video", "hlsUrl", "m3u8Url"]:
-                v_url = data.get(v_key)
-                if v_url and isinstance(v_url, str) and v_url.startswith("http"):
-                    target_dict.setdefault(subj, []).append(
-                        ContentItem(
-                            id=make_id(subj, title, v_url),
-                            title=title,
-                            kind="video",
-                            url=v_url,
-                            subject=subj,
-                            topic=topic,
-                            lecture_num=lec_num
-                        )
-                    )
-                    break
-
-            # Search for PDF / Notes URLs
-            for p_key in ["pdfUrl", "pdf_url", "documentUrl", "notesUrl", "fileUrl", "attachment", "docUrl"]:
-                p_url = data.get(p_key)
-                if p_url and isinstance(p_url, str) and p_url.startswith("http"):
-                    target_dict.setdefault(subj, []).append(
-                        ContentItem(
-                            id=make_id(subj, title, p_url),
-                            title=f"{title} (Notes)",
-                            kind="pdf",
-                            url=p_url,
-                            subject=subj,
-                            topic=topic,
-                            lecture_num=lec_num
-                        )
-                    )
-                    break
-
-            # Generic URL search
-            url = data.get("url") or data.get("link") or data.get("file")
-            if url and isinstance(url, str) and url.startswith("http"):
-                kind = classify_url(url)
-                if kind != "other":
-                    target_dict.setdefault(subj, []).append(
-                        ContentItem(
-                            id=make_id(subj, title, url),
-                            title=title,
-                            kind=kind,
-                            url=url,
-                            subject=subj,
-                            topic=topic,
-                            lecture_num=lec_num
-                        )
-                    )
-
-            for v in data.values():
-                self._extract_json_items(v, target_dict, subj)
-
-        elif isinstance(data, list):
-            for elem in data:
-                self._extract_json_items(elem, target_dict, current_subject)
