@@ -1,4 +1,7 @@
 __pycache__/
 *.pyc
+sent_tracker.json
 downloads/
+/tmp/downloads/
 .env
+.venv/
