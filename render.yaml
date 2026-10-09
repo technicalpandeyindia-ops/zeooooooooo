@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: sahukgs-tg-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROUP_ID
+        value: "-100XXXXXXXXXX"   # override per group via /setgroup command
+      - key: BATCH_URL
+        value: https://www.sahukgs.com/batch/1159
+      - key: SEND_VIDEOS
+        value: "true"
+      - key: MAX_FILE_SIZE_MB
+        value: "50"
+      - key: HEADLESS
+        value: "true"
+      - key: DOWNLOAD_DIR
+        value: /data/downloads
+      - key: DB_PATH
+        value: /data/sent_tracker.json
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 10
