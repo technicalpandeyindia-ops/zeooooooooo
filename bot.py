@@ -182,7 +182,7 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     await update.effective_message.reply_text(
         f"✅ Group set to: <code>{group_text}</code>\n\n"
-        "<b>Step 2/3:</b> Send the <b>Batch URL</b> (e.g. <code>https://www.sahukgs.com/batch/1159</code>):",
+        "<b>Step 2/3:</b> Send the <b>Batch URL</b> (e.g. <code>https://www.sahukgs.com/batch/1159</code> or <code>lesson_id=14392</code>):",
         parse_mode=ParseMode.HTML,
         reply_markup=reply_markup
     )
@@ -231,7 +231,7 @@ async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"• <b>Batch URL:</b> <code>{batch_url}</code>\n"
         f"• <b>Send Videos:</b> <code>{'Yes' if send_video else 'No'}</code>\n"
         f"• <b>Mode:</b> <code>{mode}</code>\n\n"
-        "<i>Scraping portal & sorting lectures sequentially, please wait...</i>",
+        "<i>Extracting all classroom folders via high-speed API, please wait...</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove()
     )
@@ -245,7 +245,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     user_id = user.id if user else update.effective_chat.id
     _sessions.pop(user_id, None)
-    await update.effective_message.reply_text("❌ Action cancelled.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("❌ Action cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -276,9 +276,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Sequential Execution Pipeline ─────────────────────────────────────────────
 
 async def run_process(bot: Bot, notification_chat_id: int, session: dict):
-    group_id = session["group_id"]
-    batch_url = session["batch_url"]
-    send_video = session["send_video"]
+    group_id = session.get("group_id")
+    batch_url = session.get("batch_url")
+    send_video = session.get("send_video", True)
 
     try:
         scraper = SahukgsScraper(batch_url=batch_url)
@@ -288,20 +288,26 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
             await safe_send(bot, notification_chat_id, "⚠️ No subjects or content found for this batch.")
             return
 
-        total_items = sum(len(s.items) for s in subjects)
-        await safe_send(bot, notification_chat_id, f"🔍 Extracted <b>{len(subjects)}</b> subjects ({total_items} items). Dispatching sequentially (Video $\\rightarrow$ Matching PDF)...", parse_mode=ParseMode.HTML)
+        total_items = sum(len(s.items or []) for s in (subjects or []))
+        await safe_send(bot, notification_chat_id, f"🔍 Extracted <b>{len(subjects)}</b> subject folders ({total_items} items). Dispatching sequentially (Video $\\rightarrow$ Matching PDF)...", parse_mode=ParseMode.HTML)
 
         sent_count = 0
         skipped_count = 0
 
-        for subj in subjects:
-            for idx, item in enumerate(subj.items, 1):
+        for subj in (subjects or []):
+            if not subj or not subj.items:
+                continue
+
+            for idx, item in enumerate((subj.items or []), 1):
+                if not item:
+                    continue
+
                 item_key = f"{group_id}:{item.url}"
                 if is_sent(item_key):
                     skipped_count += 1
                     continue
 
-                caption_text = f"<b>{html.escape(item.title)}</b>\n📚 <i>Subject: {html.escape(subj.name)}</i>"
+                caption_text = f"<b>{html.escape(item.title or '')}</b>\n📚 <i>Subject: {html.escape(subj.name or '')}</i>"
 
                 if item.kind == "video":
                     if send_video:
@@ -340,6 +346,7 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
         )
 
     except Exception as e:
+        logger.exception("Error in run_process")
         await safe_send(bot, notification_chat_id, f"❌ <b>Execution Error:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
 
 

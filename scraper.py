@@ -1,7 +1,6 @@
 """
 scraper.py — High-Speed Direct API Extractor for sahukgs.com Classroom.
-Supports both full Batch URLs (e.g. /batch/1159) and individual Lesson/Folder URLs (e.g. /lesson.html?lesson_id=14392).
-Extracts all videos and matching lecture PDFs across all subjects with 100% completeness.
+Defensively handles null/empty fields and extracts all videos and matching lecture PDFs across all subjects.
 """
 
 import asyncio
@@ -126,28 +125,36 @@ class SahukgsScraper:
             topics_to_fetch: list[dict] = []
 
             if target_type == "lesson":
-                # Single lesson requested
                 topics_to_fetch.append({"id": int(target_id), "name": f"Lesson {target_id}"})
             else:
-                # Full Classroom batch requested -> Fetch all lesson folders
                 classroom_api = f"{self.base_url}/api/classroom/{target_id}"
                 logger.info(f"[scraper] Fetching all classroom folders from: {classroom_api}")
                 try:
                     async with session.get(classroom_api) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            topics_to_fetch = data.get("classroom", [])
+                            if isinstance(data, dict):
+                                topics_to_fetch = data.get("classroom") or []
+                            elif isinstance(data, list):
+                                topics_to_fetch = data
                         else:
                             logger.error(f"[scraper] HTTP {resp.status} fetching classroom")
                 except Exception as e:
                     logger.error(f"[scraper] Error calling classroom API: {e}")
                     return []
 
+            if not topics_to_fetch:
+                logger.warning("[scraper] No topics returned from classroom API.")
+                return []
+
             logger.info(f"[scraper] Processing {len(topics_to_fetch)} subject folders...")
 
             for topic_idx, topic in enumerate(topics_to_fetch, 1):
+                if not isinstance(topic, dict):
+                    continue
+
                 lesson_id = topic.get("id")
-                fallback_name = topic.get("name", f"Subject {topic_idx}")
+                fallback_name = topic.get("name") or f"Subject {topic_idx}"
                 if not lesson_id:
                     continue
 
@@ -164,23 +171,29 @@ class SahukgsScraper:
                     logger.warning(f"[scraper] Exception fetching lesson {lesson_id}: {e}")
                     continue
 
+                if not isinstance(lesson_data, dict):
+                    continue
+
                 subject_name = lesson_data.get("name") or fallback_name
-                videos_meta = lesson_data.get("videos", [])
-                notes_meta = lesson_data.get("notes", [])
+                videos_meta = lesson_data.get("videos") or []
+                notes_meta = lesson_data.get("notes") or []
                 subject_items: list[ContentItem] = []
 
                 logger.info(f"[scraper] '{subject_name}' contains {len(videos_meta)} videos and {len(notes_meta)} notes.")
 
                 # Worker to resolve video streams & attached PDFs
                 async def resolve_video(v_info):
+                    if not isinstance(v_info, dict):
+                        return []
+
                     v_id = v_info.get("id")
-                    v_name = v_info.get("name", "Untitled Lecture")
+                    v_name = v_info.get("name") or "Untitled Lecture"
                     lec_num = extract_lecture_number(v_name)
                     topic_norm = normalize_topic_name(v_name)
-                    v_thumb = v_info.get("thumb", "")
+                    v_thumb = v_info.get("thumb") or ""
                     items = []
 
-                    # 1. Check direct video_url in payload
+                    # Direct video_url check
                     direct_video = v_info.get("video_url")
                     if direct_video:
                         items.append(
@@ -196,38 +209,51 @@ class SahukgsScraper:
                             )
                         )
                     elif v_id:
-                        # Fetch /api/video/{v_id} for stream
                         try:
                             async with session.get(f"{self.base_url}/api/video/{v_id}") as v_resp:
                                 if v_resp.status == 200:
                                     v_data = await v_resp.json()
-                                    final_url = v_data.get("hd_video_url") or v_data.get("video_url")
-                                    if final_url:
-                                        items.append(
-                                            ContentItem(
-                                                id=f"vid_{v_id}",
-                                                title=v_name,
-                                                kind="video",
-                                                url=final_url,
-                                                subject=subject_name,
-                                                topic=topic_norm,
-                                                lecture_num=lec_num,
-                                                thumbnail=v_thumb
+                                    if isinstance(v_data, dict):
+                                        final_url = v_data.get("hd_video_url") or v_data.get("video_url")
+                                        if final_url:
+                                            items.append(
+                                                ContentItem(
+                                                    id=f"vid_{v_id}",
+                                                    title=v_name,
+                                                    kind="video",
+                                                    url=final_url,
+                                                    subject=subject_name,
+                                                    topic=topic_norm,
+                                                    lecture_num=lec_num,
+                                                    thumbnail=v_thumb
+                                                )
                                             )
-                                        )
+                                        # Also check attached PDFs in /api/video response
+                                        for p in (v_data.get("pdfs") or []):
+                                            if isinstance(p, dict) and p.get("url"):
+                                                items.append(
+                                                    ContentItem(
+                                                        id=f"vpdf_{v_id}_{make_id('', '', p.get('url'))[:10]}",
+                                                        title=f"{v_name} (Notes)",
+                                                        kind="pdf",
+                                                        url=p.get("url"),
+                                                        subject=subject_name,
+                                                        topic=topic_norm,
+                                                        lecture_num=lec_num
+                                                    )
+                                                )
                         except Exception:
                             pass
 
-                    # 2. Extract matching PDFs attached directly to this video
-                    for p in v_info.get("pdfs", []):
-                        pdf_url = p.get("url")
-                        if pdf_url:
+                    # Extract matching PDFs attached directly to this video metadata
+                    for p in (v_info.get("pdfs") or []):
+                        if isinstance(p, dict) and p.get("url"):
                             items.append(
                                 ContentItem(
-                                    id=f"vpdf_{v_id}_{make_id('', '', pdf_url)[:10]}",
+                                    id=f"vpdf_{v_id}_{make_id('', '', p.get('url'))[:10]}",
                                     title=f"{v_name} (Notes)",
                                     kind="pdf",
-                                    url=pdf_url,
+                                    url=p.get("url"),
                                     subject=subject_name,
                                     topic=topic_norm,
                                     lecture_num=lec_num
@@ -238,13 +264,16 @@ class SahukgsScraper:
 
                 # Worker to resolve standalone notes
                 async def resolve_note(n_info):
+                    if not isinstance(n_info, dict):
+                        return []
+
                     n_id = n_info.get("id")
-                    n_name = n_info.get("name", "Untitled Note")
+                    n_name = n_info.get("name") or "Untitled Note"
                     lec_num = extract_lecture_number(n_name)
                     topic_norm = normalize_topic_name(n_name)
                     items = []
 
-                    direct_pdf = n_info.get("url") or (n_info.get("pdfs")[0].get("url") if n_info.get("pdfs") else None)
+                    direct_pdf = n_info.get("url") or ((n_info.get("pdfs") or [{}])[0].get("url") if n_info.get("pdfs") else None)
                     if direct_pdf:
                         items.append(
                             ContentItem(
@@ -262,38 +291,40 @@ class SahukgsScraper:
                             async with session.get(f"{self.base_url}/api/video/{n_id}") as n_resp:
                                 if n_resp.status == 200:
                                     n_data = await n_resp.json()
-                                    pdf_url = n_data.get("video_url") or (n_data.get("pdfs")[0].get("url") if n_data.get("pdfs") else None)
-                                    if pdf_url:
-                                        items.append(
-                                            ContentItem(
-                                                id=f"note_{n_id}",
-                                                title=n_name,
-                                                kind="pdf",
-                                                url=pdf_url,
-                                                subject=subject_name,
-                                                topic=topic_norm,
-                                                lecture_num=lec_num
+                                    if isinstance(n_data, dict):
+                                        pdf_url = n_data.get("video_url") or ((n_data.get("pdfs") or [{}])[0].get("url") if n_data.get("pdfs") else None)
+                                        if pdf_url:
+                                            items.append(
+                                                ContentItem(
+                                                    id=f"note_{n_id}",
+                                                    title=n_name,
+                                                    kind="pdf",
+                                                    url=pdf_url,
+                                                    subject=subject_name,
+                                                    topic=topic_norm,
+                                                    lecture_num=lec_num
+                                                )
                                             )
-                                        )
                         except Exception:
                             pass
 
                     return items
 
-                # Fetch all videos and notes concurrently
-                video_tasks = [resolve_video(v) for v in videos_meta]
-                note_tasks = [resolve_note(n) for n in notes_meta]
+                # Execute resolution tasks concurrently
+                video_tasks = [resolve_video(v) for v in (videos_meta or [])]
+                note_tasks = [resolve_note(n) for n in (notes_meta or [])]
 
                 results = await asyncio.gather(*video_tasks, *note_tasks)
                 for res in results:
-                    subject_items.extend(res)
+                    if res:
+                        subject_items.extend(res)
 
-                # Sort sequentially: Lecture 1 -> Lecture 2 -> Lecture 3...
+                # Organize sequentially
                 organized_items = self._organize_sequential(subject_items)
                 if organized_items:
                     subjects_list.append(Subject(name=subject_name, items=organized_items))
 
-        total_extracted = sum(len(s.items) for s in subjects_list)
+        total_extracted = sum(len(s.items or []) for s in subjects_list)
         logger.info(f"[scraper] ✅ Extracted {len(subjects_list)} folders with {total_extracted} total items.")
         return subjects_list
 
@@ -302,6 +333,9 @@ class SahukgsScraper:
         Pairs each lecture's Video directly with its corresponding PDF notes,
         sorted in ascending numerical order (Lecture 01, Lecture 02, etc.).
         """
+        if not items:
+            return []
+
         groups: dict[str, list[ContentItem]] = {}
         for item in items:
             key = f"{item.lecture_num:06.2f}_{item.topic.lower()}"
@@ -316,7 +350,6 @@ class SahukgsScraper:
             pdfs = [i for i in group_items if i.kind in ("pdf", "notes")]
             others = [i for i in group_items if i not in videos and i not in pdfs]
 
-            # Sequence: Video first, then its corresponding PDF Notes
             result.extend(videos)
             result.extend(pdfs)
             result.extend(others)
