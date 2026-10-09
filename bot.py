@@ -26,7 +26,11 @@ from scraper import SahukgsScraper, Subject, ContentItem
 from downloader import download_video, download_file
 from db import is_sent, mark_sent, get_all_sent, clear_group
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 
 # ── Instant HTTP Health Check Server (Render Port Binding) ────────────────────
@@ -39,7 +43,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK - Sahukgs Telegram Bot is Alive\n")
 
     def log_message(self, format, *args):
-        # Suppress noisy healthcheck access logs
         return
 
 
@@ -53,7 +56,7 @@ def start_health_server():
         print(f"[http] Failed to bind health server on port {port}: {e}", flush=True)
 
 
-# Start HTTP server immediately in background daemon thread
+# Launch HTTP daemon thread immediately
 threading.Thread(target=start_health_server, daemon=True).start()
 
 # ── Conversation States ───────────────────────────────────────────────────────
@@ -117,8 +120,7 @@ def fmt_item_link(idx: int, item: ContentItem) -> str:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
-        logger.warning("[bot] Telegram conflict: Another instance is polling. Retrying in 10s...")
-        await asyncio.sleep(10)
+        logger.warning("[bot] Conflict error: Another instance is polling. Telegram will reconnect automatically.")
     else:
         logger.error(f"[bot] Handler exception: {context.error}")
 
@@ -127,17 +129,18 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Step 1: Ask user for Telegram Group ID / Channel ID."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
     _sessions[user_id] = {"mode": "extract"}
 
     default_group = getattr(config, "GROUP_ID", "")
     keyboard = [[default_group]] if default_group and not default_group.startswith("-100XXX") else None
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True) if keyboard else ReplyKeyboardRemove()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "👋 <b>Sahukgs Batch Extractor Bot</b>\n\n"
         "<b>Step 1/3:</b> Enter or choose the <b>Telegram Group / Channel ID</b> (e.g. <code>-1001234567890</code>):\n\n"
-        "<i>(Make sure this bot is an Admin in the target group with post permissions!)</i>",
+        "<i>(Make sure this bot is added as Admin in the target group with post permissions!)</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=reply_markup
     )
@@ -146,14 +149,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def cmd_download_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Step 1 (Download Mode): Ask user for Telegram Group ID."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
     _sessions[user_id] = {"mode": "download"}
 
     default_group = getattr(config, "GROUP_ID", "")
     keyboard = [[default_group]] if default_group and not default_group.startswith("-100XXX") else None
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True) if keyboard else ReplyKeyboardRemove()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "📥 <b>Download & Upload Pipeline</b>\n\n"
         "<b>Step 1/3:</b> Enter the target <b>Telegram Group / Channel ID</b>:",
         parse_mode=ParseMode.HTML,
@@ -164,8 +168,9 @@ async def cmd_download_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Step 2: Save Group ID & Ask for Batch URL."""
-    user_id = update.effective_user.id
-    group_text = update.message.text.strip()
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
+    group_text = update.effective_message.text.strip()
 
     if user_id not in _sessions:
         _sessions[user_id] = {"mode": "extract"}
@@ -175,7 +180,7 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     keyboard = [[default_batch]] if default_batch else None
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True) if keyboard else ReplyKeyboardRemove()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"✅ Group set to: <code>{group_text}</code>\n\n"
         "<b>Step 2/3:</b> Send the <b>Batch URL</b> (e.g. <code>https://www.sahukgs.com/batch/1159</code>):",
         parse_mode=ParseMode.HTML,
@@ -186,8 +191,9 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def handle_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Step 3: Save Batch URL & Ask for SEND_VIDEO option."""
-    user_id = update.effective_user.id
-    batch_text = update.message.text.strip()
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
+    batch_text = update.effective_message.text.strip()
 
     if user_id not in _sessions:
         _sessions[user_id] = {"mode": "extract"}
@@ -207,8 +213,9 @@ async def handle_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Final Step: Save SEND_VIDEO choice and start pipeline."""
-    user_id = update.effective_user.id
-    choice = update.message.text.strip().lower()
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
+    choice = update.effective_message.text.strip().lower()
 
     send_video = choice.startswith("yes") or choice == "true" or "send video" in choice
     session = _sessions.get(user_id, {})
@@ -218,7 +225,7 @@ async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     batch_url = session.get("batch_url")
     mode = session.get("mode", "extract")
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "🚀 <b>Starting Pipeline...</b>\n\n"
         f"• <b>Target Group:</b> <code>{group_id}</code>\n"
         f"• <b>Batch URL:</b> <code>{batch_url}</code>\n"
@@ -235,28 +242,30 @@ async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel flow."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
     _sessions.pop(user_id, None)
-    await update.message.reply_text("❌ Action cancelled.", reply_markup=ReplyKeyboardRemove())
+    await update.effective_message.reply_text("❌ Action cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset tracker database for a specific group."""
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id if user else update.effective_chat.id
     session = _sessions.get(user_id, {})
     group_id = session.get("group_id") or getattr(config, "GROUP_ID", "")
     if group_id:
         clear_group(group_id)
-        await update.message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>.", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text("⚠️ No group configured to reset. Run /start first.")
+        await update.effective_message.reply_text("⚠️ No group configured to reset. Run /start first.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View bot status and sent counts."""
     all_sent = get_all_sent()
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"📊 <b>Bot Status</b>\n\n"
         f"• Total items sent recorded: <b>{len(all_sent)}</b>\n"
         f"• Default Batch URL: <code>{config.BATCH_URL}</code>",
@@ -326,19 +335,20 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
         await safe_send(bot, notification_chat_id, f"❌ <b>Execution Error:</b> <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
 
 
-# ── Main Async Runner ─────────────────────────────────────────────────────────
+# ── Main Entrypoint ───────────────────────────────────────────────────────────
 
-async def run_bot_async():
+def main():
     token = getattr(config, "BOT_TOKEN", None) or os.environ.get("BOT_TOKEN")
     if not token or token == "YOUR_BOT_TOKEN":
         logger.error("[bot] ❌ CRITICAL: BOT_TOKEN is missing! Set BOT_TOKEN in Render Environment Variables.")
-        # Do not exit process immediately so HTTP server stays up for Render health check
         while True:
-            await asyncio.sleep(60)
+            time.sleep(60)
 
+    # Initialize Telegram Application
     app = Application.builder().token(token).build()
     app.add_error_handler(error_handler)
 
+    # Setup Conversation Handler
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
@@ -351,32 +361,16 @@ async def run_bot_async():
             ASK_SEND_VIDEO: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_send_video)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
     )
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    logger.info("[bot] Initializing bot and dropping pending updates...")
-    await app.initialize()
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logger.warning(f"[bot] delete_webhook notice: {e}")
-
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("[bot] Polling active and listening for Telegram updates.")
-
-    while True:
-        await asyncio.sleep(3600)
-
-
-def main():
-    try:
-        asyncio.run(run_bot_async())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("[bot] Bot stopped.")
+    logger.info("[bot] Starting standard Telegram polling loop...")
+    # Standard python-telegram-bot polling loop handles worker queues and message dispatching
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
