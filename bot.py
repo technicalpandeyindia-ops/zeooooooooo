@@ -113,7 +113,7 @@ async def safe_send_video(bot: Bot, chat_id, file_path: Path, caption: str):
 def fmt_item_link(idx: int, item: ContentItem) -> str:
     em = EMOJI.get(item.kind, "🔗")
     title = html.escape(item.title or f"Item {idx}")
-    return f'{idx}. {em} <a href="{item.url}">{title}</a>'
+    return f'{em} <a href="{item.url}"><b>{title}</b></a>\n📚 <i>Subject: {html.escape(item.subject)}</i>'
 
 
 # ── Global Error Handler ──────────────────────────────────────────────────────
@@ -226,12 +226,12 @@ async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     mode = session.get("mode", "extract")
 
     await update.effective_message.reply_text(
-        "🚀 <b>Starting Pipeline...</b>\n\n"
+        "🚀 <b>Starting Sequential Lecture-Wise Pipeline...</b>\n\n"
         f"• <b>Target Group:</b> <code>{group_id}</code>\n"
         f"• <b>Batch URL:</b> <code>{batch_url}</code>\n"
         f"• <b>Send Videos:</b> <code>{'Yes' if send_video else 'No'}</code>\n"
         f"• <b>Mode:</b> <code>{mode}</code>\n\n"
-        "<i>Scraping portal with Chromium engine, please wait...</i>",
+        "<i>Scraping portal & sorting lectures sequentially, please wait...</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove()
     )
@@ -257,7 +257,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id = session.get("group_id") or getattr(config, "GROUP_ID", "")
     if group_id:
         clear_group(group_id)
-        await update.effective_message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>.", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>. You can now re-send all batch content in sequential order.", parse_mode=ParseMode.HTML)
     else:
         await update.effective_message.reply_text("⚠️ No group configured to reset. Run /start first.")
 
@@ -273,7 +273,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Execution Pipeline ────────────────────────────────────────────────────────
+# ── Sequential Execution Pipeline ─────────────────────────────────────────────
 
 async def run_process(bot: Bot, notification_chat_id: int, session: dict):
     group_id = session["group_id"]
@@ -289,7 +289,7 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
             return
 
         total_items = sum(len(s.items) for s in subjects)
-        await safe_send(bot, notification_chat_id, f"🔍 Extracted <b>{len(subjects)}</b> subjects ({total_items} items). Dispatching to group...", parse_mode=ParseMode.HTML)
+        await safe_send(bot, notification_chat_id, f"🔍 Extracted <b>{len(subjects)}</b> subjects ({total_items} items). Dispatching sequentially (Video $\\rightarrow$ Matching PDF)...", parse_mode=ParseMode.HTML)
 
         sent_count = 0
         skipped_count = 0
@@ -301,12 +301,17 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
                     skipped_count += 1
                     continue
 
+                caption_text = f"<b>{html.escape(item.title)}</b>\n📚 <i>Subject: {html.escape(subj.name)}</i>"
+
                 if item.kind == "video":
                     if send_video:
                         local_file = await download_video(item.url, title=item.title)
                         if local_file and Path(local_file).exists():
-                            await safe_send_video(bot, group_id, Path(local_file), caption=f"🎬 <b>{item.title}</b>\n📚 {subj.name}")
-                            os.remove(local_file)
+                            await safe_send_video(bot, group_id, Path(local_file), caption=f"🎬 {caption_text}")
+                            try:
+                                os.remove(local_file)
+                            except Exception:
+                                pass
                         else:
                             await safe_send(bot, group_id, fmt_item_link(idx, item), parse_mode=ParseMode.HTML)
                     else:
@@ -315,19 +320,22 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
                 elif item.kind in ["pdf", "notes"]:
                     local_file = await download_file(item.url, title=item.title)
                     if local_file and Path(local_file).exists():
-                        await safe_send_doc(bot, group_id, Path(local_file), caption=f"📄 <b>{item.title}</b>\n📚 {subj.name}")
-                        os.remove(local_file)
+                        await safe_send_doc(bot, group_id, Path(local_file), caption=f"📄 {caption_text}")
+                        try:
+                            os.remove(local_file)
+                        except Exception:
+                            pass
                     else:
                         await safe_send(bot, group_id, fmt_item_link(idx, item), parse_mode=ParseMode.HTML)
 
                 mark_sent(item_key)
                 sent_count += 1
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
 
         await safe_send(
             bot,
             notification_chat_id,
-            f"✅ <b>Job Complete!</b>\n\n• Sent: <b>{sent_count}</b> new items\n• Skipped (already sent): <b>{skipped_count}</b>",
+            f"✅ <b>Sequential Batch Dispatch Completed!</b>\n\n• Sent: <b>{sent_count}</b> items\n• Skipped: <b>{skipped_count}</b>",
             parse_mode=ParseMode.HTML
         )
 
@@ -344,11 +352,9 @@ def main():
         while True:
             time.sleep(60)
 
-    # Initialize Telegram Application
     app = Application.builder().token(token).build()
     app.add_error_handler(error_handler)
 
-    # Setup Conversation Handler
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
@@ -369,7 +375,6 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
 
     logger.info("[bot] Starting standard Telegram polling loop...")
-    # Standard python-telegram-bot polling loop handles worker queues and message dispatching
     app.run_polling(drop_pending_updates=True)
 
 
