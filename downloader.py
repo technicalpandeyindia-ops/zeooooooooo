@@ -1,5 +1,5 @@
 """
-downloader.py — downloads videos, PDFs, and notes using yt-dlp / aiohttp.
+downloader.py — downloads videos, PDFs, and notes using yt-dlp / requests.
 """
 
 import asyncio
@@ -18,87 +18,79 @@ def sanitize(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()[:80]
 
 
-def guess_ext(content_type: str, url: str) -> str:
-    if "pdf" in content_type or url.lower().endswith(".pdf"):
-        return ".pdf"
-    if "zip" in content_type or url.lower().endswith(".zip"):
-        return ".zip"
-    if "mp4" in content_type or url.lower().endswith(".mp4"):
-        return ".mp4"
-    if "document" in content_type or url.lower().endswith(".docx"):
-        return ".docx"
-    return ".bin"
-
-
 async def download_video(url: str, title: str) -> Optional[Path]:
     filename = sanitize(title)
-    out_dir = Path(config.DOWNLOAD_DIR)
+    out_dir  = Path(config.DOWNLOAD_DIR)
     out_tmpl = str(out_dir / f"{filename}.%(ext)s")
 
-    print(f"[dl:video] Downloading: {title[:55]}")
+    print(f"[dl:video] {title[:55]}")
     cmd = [
         "yt-dlp",
-        "--no-playlist",
-        "--no-part",
+        "--no-playlist", "--no-part",
         "--merge-output-format", "mp4",
         "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "--max-filesize", f"{config.MAX_FILE_SIZE_MB}m",
         "-o", out_tmpl,
         url,
     ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
 
-        if proc.returncode != 0:
-            print(f"[dl:video] fail: {stderr.decode(errors='replace')[-200:]}")
-            return None
-
-        for ext in ("mp4", "mkv", "webm"):
-            p = out_dir / f"{filename}.{ext}"
-            if p.exists() and p.stat().st_size > 0:
-                return p
-    except Exception as e:
-        print(f"[dl:video] Exception during download: {e}")
+    if proc.returncode != 0:
+        print(f"[dl:video] fail: {stderr.decode(errors='replace')[-200:]}")
         return None
 
+    for ext in ("mp4", "mkv", "webm"):
+        p = out_dir / f"{filename}.{ext}"
+        if p.exists():
+            size_mb = p.stat().st_size / 1_048_576
+            if size_mb > config.MAX_FILE_SIZE_MB:
+                p.unlink(missing_ok=True)
+                return None
+            print(f"[dl:video] ok  {p.name}  ({size_mb:.1f} MB)")
+            return p
+
+    # glob fallback
+    for p in out_dir.glob(f"{filename}.*"):
+        return p
     return None
 
 
-async def download_file(url: str, title: str) -> Optional[Path]:
+async def download_file(url: str, title: str, ext: str = "pdf") -> Optional[Path]:
+    """Download a PDF / notes file via HTTP."""
     filename = sanitize(title)
-    out_dir = Path(config.DOWNLOAD_DIR)
+    dest     = Path(config.DOWNLOAD_DIR) / f"{filename}.{ext}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-
+    print(f"[dl:{ext}] {title[:55]}")
     try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                if resp.status != 200:
-                    print(f"[dl:file] Failed HTTP {resp.status} for {url}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    print(f"[dl:{ext}] HTTP {r.status}")
                     return None
-
-                ct = resp.headers.get("Content-Type", "")
-                ext = guess_ext(ct, url)
-                target_path = out_dir / f"{filename}{ext}"
-
-                with open(target_path, "wb") as f:
-                    while True:
-                        chunk = await resp.content.read(64 * 1024)
-                        if not chunk:
-                            break
+                size = 0
+                with open(dest, "wb") as f:
+                    async for chunk in r.content.iter_chunked(65536):
                         f.write(chunk)
-
-                if target_path.exists() and target_path.stat().st_size > 0:
-                    return target_path
+                        size += len(chunk)
+                        if size > config.MAX_FILE_SIZE_MB * 1_048_576:
+                            f.close()
+                            dest.unlink(missing_ok=True)
+                            print(f"[dl:{ext}] too large, skipped")
+                            return None
+        size_mb = dest.stat().st_size / 1_048_576
+        print(f"[dl:{ext}] ok  {dest.name}  ({size_mb:.1f} MB)")
+        return dest
     except Exception as e:
-        print(f"[dl:file] Error downloading {url}: {e}")
+        print(f"[dl:{ext}] error: {e}")
+        dest.unlink(missing_ok=True)
         return None
 
-    return None
+
+def guess_ext(url: str) -> str:
+    m = re.search(r"\.(pdf|docx|doc|pptx|ppt|zip|rar|txt)(\?|$)", url, re.I)
+    return m.group(1).lower() if m else "pdf"

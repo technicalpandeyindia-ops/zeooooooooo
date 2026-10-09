@@ -15,37 +15,44 @@ _lock = Lock()
 def _load() -> dict:
     if DB_PATH.exists():
         try:
-            return json.loads(DB_PATH.read_text(encoding="utf-8"))
+            return json.loads(DB_PATH.read_text())
         except Exception:
             pass
     return {}
 
 
 def _save(data: dict):
+    DB_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _key(group_id: str, content_id: str) -> str:
+    return f"{group_id}::{content_id}"
+
+
+def is_sent(group_id: str, content_id: str) -> bool:
     with _lock:
-        DB_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        data = _load()
+        return _key(group_id, content_id) in data
 
 
-def is_sent(item_key: str) -> bool:
-    """Check if item_key (group_id:url or url) has already been sent."""
-    data = _load()
-    return item_key in data
+def mark_sent(group_id: str, content_id: str, meta: dict = None):
+    with _lock:
+        data = _load()
+        data[_key(group_id, content_id)] = meta or {}
+        _save(data)
 
 
-def mark_sent(item_key: str):
-    """Mark item_key as sent."""
-    data = _load()
-    data[item_key] = True
-    _save(data)
-
-
-def get_all_sent() -> list[str]:
-    """Retrieve list of all sent item keys."""
-    return list(_load().keys())
+def get_all_sent(group_id: str) -> set[str]:
+    with _lock:
+        data = _load()
+        prefix = f"{group_id}::"
+        return {k[len(prefix):] for k in data if k.startswith(prefix)}
 
 
 def clear_group(group_id: str):
-    """Clear sent tracking history for a specific group."""
-    data = _load()
-    filtered = {k: v for k, v in data.items() if not k.startswith(f"{group_id}:")}
-    _save(filtered)
+    with _lock:
+        data = _load()
+        keys_to_del = [k for k in data if k.startswith(f"{group_id}::")]
+        for k in keys_to_del:
+            del data[k]
+        _save(data)
