@@ -1,5 +1,5 @@
 """
-bot.py — Sahukgs Batch Extractor Telegram Bot (Interactive Flow + Instant HTTP Healthcheck)
+bot.py — Sahukgs Batch Extractor Telegram Bot (Interactive Flow + Keep-Alive + Resume & Anti-Duplicate Engine)
 """
 
 import asyncio
@@ -13,6 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from telegram import Bot, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -24,7 +25,7 @@ from telegram.error import TelegramError, RetryAfter, Conflict
 import config
 from scraper import SahukgsScraper, Subject, ContentItem
 from downloader import download_video, download_file
-from db import is_sent, mark_sent, get_all_sent, clear_group
+from db import is_already_sent, mark_as_sent, get_all_sent_count, clear_group
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,11 +60,33 @@ def start_health_server():
 # Launch HTTP daemon thread immediately
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# ── Conversation States ───────────────────────────────────────────────────────
-ASK_GROUP, ASK_BATCH, ASK_SEND_VIDEO = range(3)
 
-# ── Per-User Session State ────────────────────────────────────────────────────
+# ── Render Free-Tier Anti-Sleep Self Pinger ───────────────────────────────────
+
+def start_self_pinger():
+    """Pings the local HTTP server every 5 minutes to keep Render alive during long batch runs."""
+    port = int(os.environ.get("PORT", "10000"))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    
+    while True:
+        time.sleep(280) # 4.6 minutes
+        try:
+            import urllib.request
+            target = external_url if external_url else f"http://127.0.0.1:{port}/"
+            req = urllib.request.Request(target, headers={"User-Agent": "Render-KeepAlive/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    logger.info("[keepalive] Self-ping successful — container kept awake.")
+        except Exception as e:
+            logger.debug(f"[keepalive] Ping notice: {e}")
+
+
+threading.Thread(target=start_self_pinger, daemon=True).start()
+
+# ── Conversation States & Strong Task References ──────────────────────────────
+ASK_GROUP, ASK_BATCH, ASK_SEND_VIDEO = range(3)
 _sessions: dict[int, dict] = {}
+_background_tasks: set = set()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 EMOJI = {"video": "🎬", "pdf": "📄", "notes": "📝"}
@@ -226,17 +249,20 @@ async def handle_send_video(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     mode = session.get("mode", "extract")
 
     await update.effective_message.reply_text(
-        "🚀 <b>Starting Sequential Lecture-Wise Pipeline...</b>\n\n"
+        "🚀 <b>Starting Sequential Pipeline (Skipping Previously Sent Items)...</b>\n\n"
         f"• <b>Target Group:</b> <code>{group_id}</code>\n"
         f"• <b>Batch URL:</b> <code>{batch_url}</code>\n"
         f"• <b>Send Videos:</b> <code>{'Yes' if send_video else 'No'}</code>\n"
         f"• <b>Mode:</b> <code>{mode}</code>\n\n"
-        "<i>Extracting all classroom folders via high-speed API, please wait...</i>",
+        "<i>Checking previously sent items & resuming where you left off...</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove()
     )
 
-    asyncio.create_task(run_process(context.bot, update.effective_chat.id, session))
+    task = asyncio.create_task(run_process(context.bot, update.effective_chat.id, session))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
     return ConversationHandler.END
 
 
@@ -257,17 +283,17 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_id = session.get("group_id") or getattr(config, "GROUP_ID", "")
     if group_id:
         clear_group(group_id)
-        await update.effective_message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>. You can now re-send all batch content in sequential order.", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(f"🧹 Cleared tracking history for <code>{group_id}</code>. All batch items will now send from scratch.", parse_mode=ParseMode.HTML)
     else:
-        await update.effective_message.reply_text("⚠️ No group configured to reset. Run /start first.")
+        await update.message.reply_text("⚠️ No group configured to reset. Run /start first.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """View bot status and sent counts."""
-    all_sent = get_all_sent()
+    count = get_all_sent_count()
     await update.effective_message.reply_text(
         f"📊 <b>Bot Status</b>\n\n"
-        f"• Total items sent recorded: <b>{len(all_sent)}</b>\n"
+        f"• Total tracked items already sent: <b>{count}</b>\n"
         f"• Default Batch URL: <code>{config.BATCH_URL}</code>",
         parse_mode=ParseMode.HTML
     )
@@ -289,7 +315,13 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
             return
 
         total_items = sum(len(s.items or []) for s in (subjects or []))
-        await safe_send(bot, notification_chat_id, f"🔍 Extracted <b>{len(subjects)}</b> subject folders ({total_items} items). Dispatching sequentially (Video $\\rightarrow$ Matching PDF)...", parse_mode=ParseMode.HTML)
+        await safe_send(
+            bot,
+            notification_chat_id,
+            f"🔍 <b>Found {len(subjects)} Folders ({total_items} Total Items)</b>\n"
+            "Checking duplicates and sending only remaining new items...",
+            parse_mode=ParseMode.HTML
+        )
 
         sent_count = 0
         skipped_count = 0
@@ -302,8 +334,8 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
                 if not item:
                     continue
 
-                item_key = f"{group_id}:{item.url}"
-                if is_sent(item_key):
+                # Multi-key duplicate check (matches by URL, Title, and Subject)
+                if is_already_sent(group_id, subj.name, item.title, item.url):
                     skipped_count += 1
                     continue
 
@@ -334,14 +366,22 @@ async def run_process(bot: Bot, notification_chat_id: int, session: dict):
                     else:
                         await safe_send(bot, group_id, fmt_item_link(idx, item), parse_mode=ParseMode.HTML)
 
-                mark_sent(item_key)
+                # Mark item as sent under all matching keys
+                mark_as_sent(group_id, subj.name, item.title, item.url)
                 sent_count += 1
+
+                # Send progress update every 20 newly sent items
+                if sent_count > 0 and sent_count % 20 == 0:
+                    await safe_send(bot, notification_chat_id, f"📦 <b>Live Progress:</b> Sent {sent_count} new items (Skipped {skipped_count} existing)...")
+
                 await asyncio.sleep(2.0)
 
         await safe_send(
             bot,
             notification_chat_id,
-            f"✅ <b>Sequential Batch Dispatch Completed!</b>\n\n• Sent: <b>{sent_count}</b> items\n• Skipped: <b>{skipped_count}</b>",
+            f"✅ <b>Job Complete!</b>\n\n"
+            f"• Newly Sent: <b>{sent_count}</b> items\n"
+            f"• Skipped (Already in group): <b>{skipped_count}</b> items",
             parse_mode=ParseMode.HTML
         )
 
